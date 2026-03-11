@@ -1,88 +1,40 @@
 ---
-name: reddit-openclaw-daily
-description: Build, install, configure, and maintain a daily Reddit watcher for OpenClaw-related topics. Use when the user wants to deploy a reusable Reddit monitoring/report pipeline, install it on another OpenClaw instance, generate local project files plus cron templates, tune feed sources/schedules/targets, or package/publish the watcher as a shareable skill.
+name: reddit-daily-top9
+description: Build, install, configure, and maintain a reusable Reddit daily Top 9 watcher. Use when the user wants to deploy a natural-language configurable Reddit report pipeline, install it on another OpenClaw instance, tune topics/schedule/target, or package it as a shareable skill.
 ---
 
-# reddit-openclaw-daily
+# reddit-daily-top9
 
-Install and operate a reusable Reddit daily watcher focused on OpenClaw topics.
+一个可复用的 Reddit 日报 skill。
 
-## Core workflow
+## 核心能力
+- 通过 `topics.json` 管理关注目标
+- 把 `topics` 解析成 feed candidates
+- 抓取 Reddit 内容并落盘
+- 本地排序、去重、筛选出每天最多 9 条
+- 通过 cron 模板按 `send_time` 派生调度
 
-1. Install the runnable project with `scripts/install_local.py`.
-2. Review or edit `config.json`, `feeds.json`, and `cron_templates.json` in the target project directory.
-3. Use the generated cron templates to create scheduled jobs with the OpenClaw `cron` tool.
-4. Run a one-shot collector round and a prepare/send dry run before declaring success.
-5. Package the skill when the user asks for a distributable `.skill` file.
+## 安装流程
+1. 运行 `scripts/install_local.py`
+2. 检查生成的 `config.json`、`topics.json`、`cron_templates.json`、`onboard.md`
+3. 用 `cron` 工具把模板真正创建成任务
+4. 手动跑一轮 `collector.py` 和 `final_send.py --prepare/--send` 验证
 
-## What this skill contains
-
-### scripts/install_local.py
-Create a runnable local project from the bundled scripts.
-
-Example:
-
-```bash
-python3 /root/skills/reddit-openclaw-daily/scripts/install_local.py \
-  --base-dir ~/reddit-openclaw-daily \
-  --channel telegram \
-  --target 123456789
-```
-
-This writes:
-
+## 生成文件
 - `collector.py`
 - `final_send.py`
+- `topic_resolver.py`
 - `config.json`
-- `feeds.json`
+- `topics.json`
 - `cron_templates.json`
+- `onboard.md`
 - `.gitignore`
 
-### scripts/collector.py
-Collect Reddit RSS posts and comment RSS into a daily local dataset.
+## 设计边界
+- 不再使用 `feeds.json`
+- 默认不生成 receipt 任务
+- 默认 starter topic 仅保留 `r/openclaw`
+- 当前 `post` topic 仅识别，不承诺已完整接入现有抓取主链
 
-Use `--feeds-file <path>` to override the default feed list.
-
-Example:
-
-```bash
-python3 ~/reddit-openclaw-daily/collector.py --once --feeds-file ~/reddit-openclaw-daily/feeds.json
-```
-
-### scripts/final_send.py
-Build the candidate set, maintain `send_state.json`, and manage mark-sent / mark-failed acknowledgements.
-
-Examples:
-
-```bash
-python3 ~/reddit-openclaw-daily/final_send.py --base-dir ~/reddit-openclaw-daily --date today --prepare
-python3 ~/reddit-openclaw-daily/final_send.py --base-dir ~/reddit-openclaw-daily --date today --send
-```
-
-## Installation notes
-
-- Keep target chat IDs, cron schedules, and deployment paths out of the skill source. Put them in `config.json` and `cron_templates.json`.
-- Preserve the default Chinese card style unless the user explicitly wants a different report format.
-- Treat `cron_templates.json` as generated scaffolding. Use it to create real jobs with the `cron` tool; do not assume jobs already exist.
-
-## Validation checklist
-
-After installing on a new instance:
-
-1. Run `collector.py --once`.
-2. Confirm `daily/YYYY-MM-DD/clean/report_source.json` exists.
-3. Run `final_send.py --prepare`.
-4. Run `final_send.py --send`.
-5. Confirm the returned payload has `ready_for_send` and a non-empty `items` list when enough sources exist.
-
-## Packaging
-
-When the user asks for a distributable package, run:
-
-```bash
-python3 /usr/lib/node_modules/openclaw/skills/skill-creator/scripts/package_skill.py /root/skills/reddit-openclaw-daily
-```
-
-## References
-
-- Read `references/config.md` when you need field-level guidance for `config.json`, `feeds.json`, or generated cron templates.
+## 参考
+- 配置说明见：`references/config.md`

@@ -1,81 +1,85 @@
 # Configuration Reference
 
-## Generated files
-
-After running `scripts/install_local.py`, the target project contains:
-
-- `config.json`: runtime configuration
-- `feeds.json`: RSS feed list
-- `cron_templates.json`: OpenClaw cron job scaffolding
+## 生成文件
+运行 `scripts/install_local.py` 后，会生成：
+- `config.json`
+- `topics.json`
+- `cron_templates.json`
+- `onboard.md`
 
 ## config.json
+### 顶层字段
+- `name`: 固定为 `reddit-daily-top9`
+- `base_dir`: 运行目录
+- `timezone`: 时区
+- `send_time`: 每天发送时间，格式 `HH:MM`
 
 ### delivery
-- `channel`: messaging channel, for example `telegram`
-- `target`: destination chat/user/thread identifier. This must be filled per instance.
+- `channel`: 发送通道，如 `telegram`
+- `target`: 发送目标
+
+### limits
+- `top_n`: 每日报告上限，默认 `9`
+- `prepare_top_n`: prepare 阶段保留候选数，默认 `18`
+- `per_topic_daily_cap`: 单 topic 每日抓取预算，默认 `100`
+- `total_daily_cap`: 总抓取预算，默认 `500`
+- `topic_soft_limit`: 建议 topic 数上限，默认 `5`
 
 ### collector
-- `schedule`: cron expression for collection rounds
-- `stop_hour`: hard stop hour for the collection window
-- `interval_minutes`: loop interval when running in non-`--once` mode
-- `max_posts_per_round`: per-round cap
-
-### prepare
-- `schedule`: cron expression for prepare rounds
-- `prepare_top_n`: candidate pool size before final cut
-- `top_n`: final count used during prepare/send
+- `max_posts_per_round`: 每轮最多处理帖子数，默认 `40`
 
 ### report
-- `receipt_enabled`: whether to send a short pre-send receipt
-- `receipt_schedule`: cron expression for the receipt
-- `send_schedule`: cron expression for the final send job
-- `top_n`: required send count
-- `retry_attempts`: retries per failed message
-- `insufficient_alert`: alert text when not enough cards are ready
-- `partial_failure_alert`: alert text when some cards fail to send
+- `retry_attempts`: 单条发送重试次数
+- `insufficient_alert`: 候选不足告警
+- `partial_failure_alert`: 部分发送失败告警
 
 ### format
-Opinionated defaults are intentionally preserved:
-- `language=zh`
-- localized Chinese title first
-- `原标题：...` on its own line
-- recognition line included
+- `language`: 默认中文
+- `quality_filter`: 默认 `标准偏高`
 
-## feeds.json
+## topics.json
+统一 topic 列表。
 
-List of objects:
+当前支持的输入模型：
+- `subreddit`
+- `search`
+- `feed`
+- `keyword`
+- `post`（当前仅识别，未完整接入抓取主链）
 
+推荐字段：
 ```json
 [
-  {"name": "r/openclaw", "url": "https://www.reddit.com/r/openclaw/hot/.rss?limit=30"},
-  {"name": "r/OpenClawUseCases", "url": "https://www.reddit.com/r/OpenClawUseCases/hot/.rss?limit=30"},
-  {"name": "search/openclaw", "url": "https://www.reddit.com/search.rss?q=openclaw&sort=hot&t=day"}
+  {
+    "type": "subreddit",
+    "raw_input": "r/openclaw",
+    "canonical_url": "https://www.reddit.com/r/openclaw/",
+    "normalized_key": "subreddit:r/openclaw",
+    "label": "r/openclaw",
+    "enabled": true,
+    "source": "starter",
+    "priority": "normal",
+    "daily_cap": 100,
+    "added_at": "2026-03-11T00:00:00+08:00"
+  }
 ]
 ```
 
 ## cron_templates.json
+调度围绕 `send_time` 自动派生：
+- collector window：T-110m 到 T-10m，每 20 分钟
+- prepare window：T-105m 到 T-5m，每 20 分钟
+- final send：T
+- 默认不生成 receipt 任务
 
-The generated file is a convenience artifact. It contains job specs for:
-
-- `reddit-openclaw-collector-window`
-- `reddit-openclaw-prepare-window`
-- `reddit-openclaw-receipt-before-send`
-- `reddit-openclaw-report-send`
-
-Use those payloads with the OpenClaw `cron` tool. Review the `delivery.target` field before creating jobs.
-
-## Safe customization boundary
-
-Keep these configurable per instance:
-- chat/user/thread target
-- timezone
-- cron expressions
-- base install directory
-- alert text
-- feed list
-
-Keep these as the default product behavior unless the user says otherwise:
-- Chinese card output
-- title localization behavior
-- original title line
-- recognition summary line
+## onboard.md
+首装欢迎与当前任务展示统一使用 `onboard.md`。
+默认显示：
+- 当前 topics
+- 发送时间
+- 时区
+- 发送位置
+- 每日报告上限
+- 输出语言
+- 质量过滤
+- 可直接对话修改示例

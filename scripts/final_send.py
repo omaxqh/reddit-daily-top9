@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 
 TZ = timezone(timedelta(hours=8))
 TMP_SUFFIX = ".tmp"
+DEFAULT_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 EXCERPT_CHARS = 320
 COMMENT_MAX_COUNT = 2
@@ -108,7 +109,7 @@ def is_noise_comment(text: str) -> bool:
     lowered = compact_text(text).lower()
     if not lowered:
         return True
-    if lowered.startswith("welcome to r/openclaw"):
+    if lowered.startswith("welcome to r/"):
         return True
     if lowered.startswith("https://preview.redd.it/"):
         return True
@@ -152,17 +153,6 @@ def build_source_seed(post: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def source_bonus(feed_name: str) -> float:
-    name = compact_text(feed_name).lower()
-    if name == "r/openclaw":
-        return 10.0
-    if name == "r/openclawusecases":
-        return 8.0
-    if name.startswith("search/"):
-        return 2.0
-    return 0.0
-
-
 def candidate_score(item: Dict[str, Any]) -> float:
     status = item.get("fetch_status", "unknown")
     body_chars = int(item.get("body_chars", 0) or 0)
@@ -171,8 +161,6 @@ def candidate_score(item: Dict[str, Any]) -> float:
     score = 28.0
     score += min(30.0, body_chars / 18.0)
     score += min(20.0, float(comment_count) * 3.5)
-    score += source_bonus(item.get("feed_name", ""))
-
     if status == "partial":
         score -= 8.0
     elif status == "failed":
@@ -214,7 +202,7 @@ def display_title(candidate: Dict[str, Any], index: int) -> str:
     if contains_chinese(title):
         return trim_text(title, 28)
     if title:
-        return f"OpenClaw话题：{trim_text(title, 24)}"
+        return f"Reddit话题：{trim_text(title, 24)}"
     return f"Reddit候选#{index}"
 
 
@@ -275,7 +263,7 @@ def build_message_text(candidate: Dict[str, Any], index: int) -> str:
 
 
 def write_report_backup(clean_dir: str, payload: Dict[str, Any]) -> None:
-    lines = [f"OpenClaw Reddit 日报 [{payload.get('date', '')} 08:00]", ""]
+    lines = [f"reddit-daily-top9 日报 [{payload.get('date', '')}]", ""]
     lines.append(f"- source_mode: {payload.get('source_mode', 'report_source_ranked')}")
     lines.append(f"- readiness: {payload.get('readiness', 'unknown')}")
     lines.append(f"- ready_for_send: {payload.get('ready_for_send', False)}")
@@ -362,8 +350,8 @@ def summarize_state(payload: Dict[str, Any]) -> Dict[str, Any]:
 def load_send_state(clean_dir: str) -> Dict[str, Any]:
     path = os.path.join(clean_dir, "send_state.json")
     payload = load_json(path, {})
-    if not isinstance(payload, dict) or "items" not in payload:
-        raise FileNotFoundError(f"send_state missing: {path}")
+    if not isinstance(payload, dict) or not payload.get("items"):
+        raise FileNotFoundError(f"send_state missing or empty: {path}")
     return payload
 
 
@@ -459,7 +447,7 @@ def run_summary(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reddit 日报 prepare/send 与发送账本维护")
-    parser.add_argument("--base-dir", default=os.path.expanduser("~/reddit-openclaw-daily"), help="项目根目录")
+    parser.add_argument("--base-dir", default=DEFAULT_BASE_DIR, help="项目根目录")
     parser.add_argument("--date", default="today", help="today | yesterday | YYYY-MM-DD")
     parser.add_argument("--prepare-top-n", type=int, default=DEFAULT_PREPARE_TOP_N, help="prepare 阶段保留候选数")
     parser.add_argument("--top-n", type=int, default=DEFAULT_SEND_TOP_N, help="最终正式发送条数")

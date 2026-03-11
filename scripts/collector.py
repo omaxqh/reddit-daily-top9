@@ -15,45 +15,29 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
+from topic_resolver import default_topics_path, load_topics, resolve_topics_to_feeds
+
 TZ = timezone(timedelta(hours=8))
 ATOM_NS = {"a": "http://www.w3.org/2005/Atom"}
-USER_AGENT = "Mozilla/5.0 (compatible; openclaw-reddit-daily/1.0)"
+USER_AGENT = "Mozilla/5.0 (compatible; reddit-daily-top9/1.0)"
 TMP_SUFFIX = ".tmp"
-
-DEFAULT_FEEDS = [
-    {"name": "r/openclaw", "url": "https://www.reddit.com/r/openclaw/hot/.rss?limit=30"},
-    {"name": "r/OpenClawUseCases", "url": "https://www.reddit.com/r/OpenClawUseCases/hot/.rss?limit=30"},
-    {"name": "search/openclaw", "url": "https://www.reddit.com/search.rss?q=openclaw&sort=hot&t=day"},
-]
-
-
-def load_feeds(path: str) -> List[Dict[str, str]]:
-    if not path:
-        return DEFAULT_FEEDS
-    try:
-        with open(path, "r", encoding="utf-8") as file:
-            payload = json.load(file)
-    except FileNotFoundError:
-        return DEFAULT_FEEDS
-    if not isinstance(payload, list):
-        return DEFAULT_FEEDS
-    rows: List[Dict[str, str]] = []
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name", "")).strip()
-        url = str(item.get("url", "")).strip()
-        if name and url:
-            rows.append({"name": name, "url": url})
-    return rows or DEFAULT_FEEDS
+DEFAULT_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def now_cn() -> datetime:
     return datetime.now(TZ)
 
 
-def resolve_stop_at(window_hours: float, stop_hour: int | None) -> datetime:
+def resolve_stop_at(window_hours: float, stop_hour: int | None, stop_at_text: str = "") -> datetime:
     now = now_cn()
+    if stop_at_text:
+        try:
+            hour_text, minute_text = stop_at_text.split(":", 1)
+            hour = int(hour_text)
+            minute = int(minute_text)
+            return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        except Exception:
+            pass
     if stop_hour is None:
         return now + timedelta(hours=window_hours)
     return now.replace(hour=stop_hour, minute=0, second=0, microsecond=0)
@@ -139,6 +123,11 @@ def save_manifest(path: str, manifest: Dict[str, Any]) -> None:
     manifest["updated_at"] = now_cn().isoformat(timespec="seconds")
     save_json(path, manifest)
 
+def load_runtime_feeds(base_dir: str, topics_file: str) -> Tuple[List[Dict[str, str]], List[str]]:
+    topics_path = topics_file or default_topics_path(base_dir)
+    topics = load_topics(topics_path)
+    return resolve_topics_to_feeds(topics)
+
 
 def acquire_lock(lock_path: str, progress_path: str) -> bool:
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
@@ -213,7 +202,9 @@ def http_get(url: str, timeout: int = 25) -> Tuple[bool, str, str]:
         return False, "", f"unexpected:{error}"
 
 
-def parse_feed_entries(feed_xml: str, feed_name: str, feed_url: str) -> List[Dict[str, Any]]:
+def parse_feed_entries(feed_xml: str, feed: Dict[str, Any]) -> List[Dict[str, Any]]:
+    feed_name = str(feed.get("name", "")).strip()
+    feed_url = str(feed.get("url", "")).strip()
     root = ET.fromstring(feed_xml)
     entries = root.findall("a:entry", ATOM_NS)
     rows: List[Dict[str, Any]] = []
@@ -257,6 +248,10 @@ def parse_feed_entries(feed_xml: str, feed_name: str, feed_url: str) -> List[Dic
                 "entry_id": entry_id,
                 "feed_name": feed_name,
                 "feed_url": feed_url,
+                "topic_key": feed.get("topic_key", ""),
+                "topic_label": feed.get("topic_label", feed_name),
+                "topic_type": feed.get("topic_type", ""),
+                "daily_cap": int(feed.get("daily_cap", 0) or 0),
                 "body_html": content_html,
                 "summary_html": summary_html,
             }
@@ -314,6 +309,8 @@ def write_markdown_post(path: str, post: Dict[str, Any]) -> None:
         f"- id: {post.get('id', '')}",
         f"- url: {post.get('url', '')}",
         f"- feed: {post.get('feed_name', '')}",
+        f"- topic: {post.get('topic_label', '')}",
+        f"- topic_key: {post.get('topic_key', '')}",
         f"- fetch_status: {post.get('fetch_status', '')}",
         f"- fail_reason: {post.get('fail_reason', '')}",
         "",
@@ -416,6 +413,9 @@ def reconcile_day_state(
             "title": record.get("title", ""),
             "url": record.get("url", ""),
             "feed_name": record.get("feed_name", ""),
+            "topic_key": record.get("topic_key", ""),
+            "topic_label": record.get("topic_label", ""),
+            "topic_type": record.get("topic_type", ""),
             "captured_at": record.get("captured_at", ""),
             "fetch": {
                 "status": record.get("fetch_status", "done"),
@@ -440,10 +440,18 @@ def process_round(
     seen_today: set[str],
     seen_global: Dict[str, str],
     max_posts_per_round: int,
-    feeds: List[Dict[str, str]],
+    base_dir: str,
+    topics_file: str,
 ) -> Tuple[int, int, int]:
     collected = load_json(os.path.join(dirs["clean"], "report_source.json"), [])
     collected_by_id = {item.get("id"): item for item in collected if item.get("id")}
+
+    feeds, warnings = load_runtime_feeds(base_dir, topics_file)
+    for warning in warnings:
+        append_log(dirs["progress"], f"topic_warning={warning}")
+    if not feeds:
+        append_log(dirs["progress"], "collector_skip reason=no_resolved_feeds")
+        return 0, 0, 0
 
     new_feed_rows: List[Dict[str, Any]] = []
     for feed in feeds:
@@ -453,7 +461,7 @@ def process_round(
         if ok:
             atomic_write_text(raw_path, body)
             try:
-                rows = parse_feed_entries(body, feed["name"], feed["url"])
+                rows = parse_feed_entries(body, feed)
                 new_feed_rows.extend(rows)
                 append_log(dirs["progress"], f"feed={feed['name']} fetched entries={len(rows)}")
             except Exception as parse_error:
@@ -482,6 +490,9 @@ def process_round(
                 "title": entry.get("title", ""),
                 "url": entry.get("url", ""),
                 "feed_name": entry.get("feed_name", ""),
+                "topic_key": entry.get("topic_key", ""),
+                "topic_label": entry.get("topic_label", ""),
+                "topic_type": entry.get("topic_type", ""),
                 "fetch": {
                     "status": "in_progress",
                     "body_ready": False,
@@ -544,6 +555,10 @@ def process_round(
             "updated": entry.get("updated", ""),
             "feed_name": entry.get("feed_name", ""),
             "feed_url": entry.get("feed_url", ""),
+            "topic_key": entry.get("topic_key", ""),
+            "topic_label": entry.get("topic_label", ""),
+            "topic_type": entry.get("topic_type", ""),
+            "daily_cap": int(entry.get("daily_cap", 0) or 0),
             "body": body,
             "comments": comments,
             "fetch_status": fetch_status,
@@ -581,6 +596,9 @@ def process_round(
                 "title": record.get("title", ""),
                 "url": record.get("url", ""),
                 "feed_name": record.get("feed_name", ""),
+                "topic_key": record.get("topic_key", ""),
+                "topic_label": record.get("topic_label", ""),
+                "topic_type": record.get("topic_type", ""),
                 "captured_at": record.get("captured_at", ""),
                 "fetch": {
                     "status": fetch_status,
@@ -628,10 +646,10 @@ def run(args: argparse.Namespace) -> int:
     seen_global = load_json(seen_global_path, {})
     manifest, manifest_path = reconcile_day_state(dirs, date_key, seen_today, seen_global)
 
-    stop_at = resolve_stop_at(args.window_hours, args.stop_hour)
+    stop_at = resolve_stop_at(args.window_hours, args.stop_hour, args.stop_at)
     append_log(
         dirs["progress"],
-        f"collector_start once={args.once} window_hours={args.window_hours} interval_minutes={args.interval_minutes} stop_at={stop_at.isoformat(timespec='seconds')}",
+        f"collector_start once={args.once} window_hours={args.window_hours} interval_minutes={args.interval_minutes} stop_at={stop_at.isoformat(timespec='seconds')} topics_file={args.topics_file or default_topics_path(args.base_dir)}",
     )
 
     if args.once and now_cn() >= stop_at:
@@ -651,7 +669,8 @@ def run(args: argparse.Namespace) -> int:
             seen_today,
             seen_global,
             args.max_posts_per_round,
-            load_feeds(args.feeds_file),
+            args.base_dir,
+            args.topics_file or default_topics_path(args.base_dir),
         )
         append_log(dirs["progress"], f"round_done done={accepted} partial={partial} failed={failed}")
     else:
@@ -665,7 +684,8 @@ def run(args: argparse.Namespace) -> int:
                 seen_today,
                 seen_global,
                 args.max_posts_per_round,
-                load_feeds(args.feeds_file),
+                args.base_dir,
+                args.topics_file or default_topics_path(args.base_dir),
             )
             append_log(dirs["progress"], f"round={round_no} done={accepted} partial={partial} failed={failed}")
             remaining = (stop_at - now_cn()).total_seconds()
@@ -686,12 +706,13 @@ def run(args: argparse.Namespace) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="OpenClaw Reddit 每日抓取")
-    parser.add_argument("--base-dir", default=os.path.expanduser("~/reddit-openclaw-daily"), help="项目根目录")
-    parser.add_argument("--feeds-file", default="", help="可选 feeds JSON 文件路径")
+    parser = argparse.ArgumentParser(description="reddit-daily-top9 每日抓取")
+    parser.add_argument("--base-dir", default=DEFAULT_BASE_DIR, help="项目根目录")
+    parser.add_argument("--topics-file", default="", help="topics.json 路径，默认使用 <base-dir>/topics.json")
     parser.add_argument("--once", action="store_true", help="仅执行一轮")
     parser.add_argument("--window-hours", type=float, default=2.0, help="窗口执行时长（小时）")
     parser.add_argument("--stop-hour", type=int, default=8, help="按当天整点截止（默认 08:00）")
+    parser.add_argument("--stop-at", default="", help="按当天 HH:MM 截止，优先级高于 --stop-hour")
     parser.add_argument("--interval-minutes", type=float, default=20.0, help="轮询间隔（分钟）")
     parser.add_argument("--max-posts-per-round", type=int, default=40, help="每轮最多处理帖子数")
     return parser.parse_args()
