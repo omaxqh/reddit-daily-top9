@@ -6,9 +6,10 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 TZ = timezone(timedelta(hours=8))
 TMP_SUFFIX = ".tmp"
@@ -19,6 +20,10 @@ COMMENT_MAX_COUNT = 2
 COMMENT_MAX_CHARS = 120
 DEFAULT_PREPARE_TOP_N = 18
 DEFAULT_SEND_TOP_N = 9
+TRANSLATION_CACHE_NAME = "translation_cache.json"
+TRANSLATOR_VERSION = "v1"
+DEFAULT_TRANSLATOR_TIMEOUT = 120
+DEFAULT_TRANSLATOR_SESSION = "telegram:reddit-daily-top9-translate"
 
 
 def now_cn() -> datetime:
@@ -93,6 +98,44 @@ def normalize_title(title: str) -> str:
 def contains_chinese(text: str) -> bool:
     text = text or ""
     return any("一" <= char <= "鿿" for char in text)
+
+
+def contains_latin(text: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", text or ""))
+
+
+def strip_latin_segment(text: str) -> str:
+    text = re.sub(r"[A-Za-z][A-Za-z0-9_./:+-]*", "", text)
+    text = re.sub(r"\(\s*\)", "", text)
+    text = re.sub(r"（\s*）", "", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    text = re.sub(r"^[,，、:：;；\-\s]+", "", text)
+    text = re.sub(r"[,，、:：;；\-\s]+$", "", text)
+    return text.strip()
+
+
+def enforce_chinese_text(text: str) -> str:
+    text = compact_text(text)
+    if not text:
+        return ""
+
+    parts: List[str] = []
+    last_end = 0
+    for match in re.finditer(r"https?://\S+", text):
+        prefix = strip_latin_segment(text[last_end:match.start()])
+        if prefix:
+            parts.append(prefix)
+        parts.append(match.group(0))
+        last_end = match.end()
+    suffix = strip_latin_segment(text[last_end:])
+    if suffix:
+        parts.append(suffix)
+
+    text = " ".join(part for part in parts if part)
+    text = text.replace("`", "")
+    text = re.sub(r"\s{2,}", " ", text)
+    text = re.sub(r"([，。！？；：])\1+", r"\1", text)
+    return text.strip()
 
 
 def state_hash(items: List[Dict[str, Any]]) -> str:
@@ -197,7 +240,159 @@ def load_ranked_candidates(clean_dir: str) -> List[Dict[str, Any]]:
     return items
 
 
-def display_title(candidate: Dict[str, Any], index: int) -> str:
+def load_project_config(base_dir: str) -> Dict[str, Any]:
+    payload = load_json(os.path.join(base_dir, "config.json"), {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def resolve_format_options(base_dir: str) -> Dict[str, Any]:
+    config = load_project_config(base_dir)
+    format_cfg = config.get("format", {}) if isinstance(config.get("format"), dict) else {}
+    translator_cfg = format_cfg.get("translator", {}) if isinstance(format_cfg.get("translator"), dict) else {}
+    language = compact_text(format_cfg.get("language", "中文")) or "中文"
+    force_chinese = bool(format_cfg.get("force_chinese", language == "中文"))
+    return {
+        "language": language,
+        "force_chinese": force_chinese,
+        "translator_enabled": bool(translator_cfg.get("enabled", force_chinese)),
+        "translator_timeout": int(translator_cfg.get("timeout_seconds", DEFAULT_TRANSLATOR_TIMEOUT) or DEFAULT_TRANSLATOR_TIMEOUT),
+        "translator_session": compact_text(translator_cfg.get("session", DEFAULT_TRANSLATOR_SESSION)) or DEFAULT_TRANSLATOR_SESSION,
+    }
+
+
+def translation_cache_path(clean_dir: str) -> str:
+    return os.path.join(clean_dir, TRANSLATION_CACHE_NAME)
+
+
+def load_translation_cache(clean_dir: str) -> Dict[str, Any]:
+    payload = load_json(translation_cache_path(clean_dir), {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_translation_cache(clean_dir: str, cache: Dict[str, Any]) -> None:
+    save_json(translation_cache_path(clean_dir), cache)
+
+
+def extract_json_object(text: str) -> Dict[str, Any]:
+    text = compact_text(text)
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("translator output missing json object")
+    return json.loads(text[start : end + 1])
+
+
+def translation_prompt(payload: Dict[str, Any]) -> str:
+    return (
+        "你是中文重写器。请把输入 JSON 改写成自然、准确、简洁的简体中文。\n"
+        "硬规则：\n"
+        "1. 只输出 JSON，不要解释，不要代码块。\n"
+        "2. 输出结构必须严格是 {\"title\":\"...\",\"excerpt\":\"...\",\"comments\":[\"...\",...]}。\n"
+        "3. 除 URL 外，不要出现任何英文字符、英文缩写或英文原句。\n"
+        "4. 产品名、项目名、库名如果无法直译，也改写成中文描述，不要保留英文。\n"
+        "5. 不要编造事实，可以适度压缩，让表述更像中文日报卡片。\n"
+        "6. 空字段保持空字符串或空数组。\n"
+        f"输入 JSON：{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def fallback_translation(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    title = enforce_chinese_text(candidate.get("title", ""))
+    if not title:
+        title = "社区帖子"
+
+    excerpt = enforce_chinese_text(candidate.get("body_excerpt", ""))
+    if not excerpt:
+        excerpt = "原帖讨论了一个与目标社区相关的话题，已抓取到部分内容，现按中文保底输出。"
+
+    comments = [enforce_chinese_text(comment) for comment in candidate.get("key_comments", []) or []]
+    comments = [comment for comment in comments if comment]
+    if not comments and int(candidate.get("comment_count", 0) or 0) > 0:
+        comments = ["评论区有补充观点，但本轮中文改写失败，建议点开原帖查看。"]
+
+    return {
+        "title": title,
+        "excerpt": excerpt,
+        "comments": comments[:COMMENT_MAX_COUNT],
+    }
+
+
+def translate_candidate(candidate: Dict[str, Any], clean_dir: str, options: Dict[str, Any], cache: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    if not options.get("force_chinese") or not options.get("translator_enabled"):
+        return fallback_translation(candidate), False
+
+    cache_key = f"{TRANSLATOR_VERSION}:{candidate_hash(candidate)}"
+    cached = cache.get(cache_key)
+    if isinstance(cached, dict):
+        return cached, False
+
+    payload = {
+        "title": compact_text(candidate.get("title", "")),
+        "excerpt": compact_text(candidate.get("body_excerpt", "")),
+        "comments": [compact_text(comment) for comment in candidate.get("key_comments", []) or []][:COMMENT_MAX_COUNT],
+    }
+
+    translated = fallback_translation(candidate)
+    try:
+        cmd = [
+            "openclaw",
+            "agent",
+            "--to",
+            str(options.get("translator_session", DEFAULT_TRANSLATOR_SESSION)),
+            "--timeout",
+            str(options.get("translator_timeout", DEFAULT_TRANSLATOR_TIMEOUT)),
+            "--verbose",
+            "off",
+            "--json",
+            "--message",
+            translation_prompt(payload),
+        ]
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=int(options.get("translator_timeout", DEFAULT_TRANSLATOR_TIMEOUT)) + 30,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(compact_text(completed.stderr or completed.stdout) or "translator cli failed")
+
+        result_payload = json.loads(completed.stdout)
+        payloads = (((result_payload or {}).get("result") or {}).get("payloads") or [])
+        if not payloads:
+            raise ValueError("translator result payloads empty")
+        translated_raw = extract_json_object(payloads[0].get("text", ""))
+        translated = {
+            "title": enforce_chinese_text(str(translated_raw.get("title", ""))),
+            "excerpt": enforce_chinese_text(str(translated_raw.get("excerpt", ""))),
+            "comments": [
+                enforce_chinese_text(str(comment))
+                for comment in translated_raw.get("comments", [])
+                if compact_text(str(comment))
+            ][:COMMENT_MAX_COUNT],
+        }
+        if not translated["title"]:
+            translated["title"] = fallback_translation(candidate)["title"]
+        if not translated["excerpt"]:
+            translated["excerpt"] = fallback_translation(candidate)["excerpt"]
+        if not translated["comments"] and int(candidate.get("comment_count", 0) or 0) > 0:
+            translated["comments"] = fallback_translation(candidate)["comments"]
+    except Exception:
+        translated = fallback_translation(candidate)
+
+    cache[cache_key] = translated
+    return translated, True
+
+
+def display_title(candidate: Dict[str, Any], index: int, translated: Dict[str, Any] | None = None, force_chinese: bool = False) -> str:
+    if force_chinese and translated:
+        title = compact_text(translated.get("title", ""))
+        if title:
+            return trim_text(title, 28)
+        return f"帖子{index}"
+
     title = compact_text(candidate.get("title", ""))
     if contains_chinese(title):
         return trim_text(title, 28)
@@ -227,16 +422,28 @@ def recognition(candidate: Dict[str, Any]) -> Dict[str, str]:
     return {"level": level, "pro": pro, "con": con}
 
 
-def build_message_text(candidate: Dict[str, Any], index: int) -> str:
-    title = display_title(candidate, index)
+def build_message_text(candidate: Dict[str, Any], index: int, clean_dir: str, options: Dict[str, Any], cache: Dict[str, Any]) -> Tuple[str, bool]:
+    force_chinese = bool(options.get("force_chinese"))
+    translated: Dict[str, Any] | None = None
+    cache_changed = False
+
+    if force_chinese:
+        translated, cache_changed = translate_candidate(candidate, clean_dir, options, cache)
+
+    title = display_title(candidate, index, translated=translated, force_chinese=force_chinese)
     original_title = compact_text(candidate.get("original_title", candidate.get("title", "")))
-    excerpt = compact_text(candidate.get("body_excerpt", ""))
     status = candidate.get("fetch_status", "unknown")
     fail_reason = compact_text(candidate.get("fail_reason", ""))
-    comments = candidate.get("key_comments", []) or []
+
+    if force_chinese and translated:
+        excerpt = compact_text(translated.get("excerpt", ""))
+        comments = translated.get("comments", []) or []
+    else:
+        excerpt = compact_text(candidate.get("body_excerpt", ""))
+        comments = candidate.get("key_comments", []) or []
 
     lines = [f"{index}. {title}"]
-    if original_title and original_title != title:
+    if not force_chinese and original_title and original_title != title:
         lines.append(f"原标题：{trim_text(original_title, 90)}")
 
     if excerpt:
@@ -259,7 +466,7 @@ def build_message_text(candidate: Dict[str, Any], index: int) -> str:
     if status != "done":
         lines.append(f"抓取状态：{status}（{fail_reason or '受限'}）")
     lines.append(candidate.get("url", ""))
-    return "\n".join(lines).strip()
+    return "\n".join(lines).strip(), cache_changed
 
 
 def write_report_backup(clean_dir: str, payload: Dict[str, Any]) -> None:
@@ -277,13 +484,17 @@ def write_report_backup(clean_dir: str, payload: Dict[str, Any]) -> None:
     atomic_write_text(os.path.join(clean_dir, "report_backup.md"), "\n".join(lines).strip() + "\n")
 
 
-def build_state(clean_dir: str, date_key: str, prepare_top_n: int, top_n: int) -> Dict[str, Any]:
+def build_state(base_dir: str, clean_dir: str, date_key: str, prepare_top_n: int, top_n: int) -> Dict[str, Any]:
     ranked = load_ranked_candidates(clean_dir)
     candidates = ranked[:prepare_top_n]
     selected = []
+    format_options = resolve_format_options(base_dir)
+    translation_cache = load_translation_cache(clean_dir)
+    cache_changed = False
 
     for index, candidate in enumerate(candidates[:top_n], start=1):
-        message_text = build_message_text(candidate, index)
+        message_text, item_cache_changed = build_message_text(candidate, index, clean_dir, format_options, translation_cache)
+        cache_changed = cache_changed or item_cache_changed
         selected.append(
             {
                 "id": candidate.get("id", f"item-{index}"),
@@ -296,6 +507,9 @@ def build_state(clean_dir: str, date_key: str, prepare_top_n: int, top_n: int) -
                 "message_text": message_text,
             }
         )
+
+    if cache_changed:
+        save_translation_cache(clean_dir, translation_cache)
 
     existing = load_json(os.path.join(clean_dir, "send_state.json"), {})
     existing_items = {item.get("id"): item for item in existing.get("items", []) if isinstance(item, dict)}
@@ -408,7 +622,7 @@ def list_pending(clean_dir: str) -> Dict[str, Any]:
 def run_prepare(args: argparse.Namespace) -> int:
     date_key = resolve_date(args.date)
     clean_dir = os.path.join(args.base_dir, "daily", date_key, "clean")
-    payload = build_state(clean_dir, date_key, args.prepare_top_n, args.top_n)
+    payload = build_state(args.base_dir, clean_dir, date_key, args.prepare_top_n, args.top_n)
     emit_json(summarize_state(payload))
     return 0
 
@@ -416,7 +630,7 @@ def run_prepare(args: argparse.Namespace) -> int:
 def run_send(args: argparse.Namespace) -> int:
     date_key = resolve_date(args.date)
     clean_dir = os.path.join(args.base_dir, "daily", date_key, "clean")
-    _ = build_state(clean_dir, date_key, args.prepare_top_n, args.top_n)
+    _ = build_state(args.base_dir, clean_dir, date_key, args.prepare_top_n, args.top_n)
     emit_json(list_pending(clean_dir))
     return 0
 

@@ -36,6 +36,17 @@
 ### format
 - `language`: 默认中文
 - `quality_filter`: 默认 `标准偏高`
+- `force_chinese`: 是否强制全中文输出（默认 `true`，当 `language` 为中文时自动启用）
+- `translator`: 翻译器配置（可选）
+  - `enabled`: 是否启用翻译器（默认 `true`）
+  - `timeout_seconds`: 单次翻译超时秒数（默认 `120`）
+  - `session`: 翻译专用会话 ID（默认 `telegram:reddit-daily-top9-translate`）
+
+**翻译说明：**
+- 启用后，标题、摘要、评论均通过 OpenClaw 内部模型中文化
+- 本地缓存 `translation_cache.json`，避免重复翻译
+- 翻译失败时自动 fallback 到保底中文文案
+- URL 保留原样，其余英文内容全部清除
 
 ## topics.json
 统一 topic 列表。
