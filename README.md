@@ -51,7 +51,7 @@ python3 /root/skills/reddit-daily-top9/scripts/install_local.py \
 
 ## 已知限制
 - 当前支持 `subreddit / search / feed / keyword / post URL` 五类 topic 输入
-- `report_0800.md` 仍作为备份文件名保留
+- `report_backup.md` 仍作为备份文件名保留
 
 一句话：
 **这不是把旧 OpenClaw 日报换个壳，而是把现有稳定主链升级成一个通用的 Reddit Top 9 skill。**

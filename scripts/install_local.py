@@ -116,7 +116,7 @@ def render_cron_templates(config: Dict[str, Any]) -> Dict[str, Any]:
                     "message": (
                         "执行 reddit-daily-top9 prepare 窗口任务。严格执行："
                         f"1) 运行 `python3 {base_dir}/final_send.py --base-dir {base_dir} --date today --prepare --prepare-top-n {limits['prepare_top_n']} --top-n {limits['top_n']}`。"
-                        f"2) 只允许写入 `{base_dir}/daily/<TODAY>/clean/send_state.json` 与 `report_0800.md`。"
+                        f"2) 只允许写入 `{base_dir}/daily/<TODAY>/clean/send_state.json` 与 `report_backup.md`。"
                         "3) 不要给用户发送正文。4) 成功只回复 `NO_REPLY`。5) 若失败，只回复一句中文错误摘要。"
                     ),
                 },
