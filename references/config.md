@@ -45,7 +45,7 @@
 - `search`
 - `feed`
 - `keyword`
-- `post`（当前仅识别，未完整接入抓取主链）
+- `post`
 
 推荐字段：
 ```json

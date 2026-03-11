@@ -205,8 +205,13 @@ def http_get(url: str, timeout: int = 25) -> Tuple[bool, str, str]:
 def parse_feed_entries(feed_xml: str, feed: Dict[str, Any]) -> List[Dict[str, Any]]:
     feed_name = str(feed.get("name", "")).strip()
     feed_url = str(feed.get("url", "")).strip()
+    single_post = str(feed.get("single_post", "")).lower() == "true"
+    target_post_url = str(feed.get("post_url", "")).strip()
+    target_post_id = str(feed.get("post_id", "")).strip().lower()
     root = ET.fromstring(feed_xml)
     entries = root.findall("a:entry", ATOM_NS)
+    if single_post and entries:
+        entries = entries[:1]
     rows: List[Dict[str, Any]] = []
     for entry in entries:
         title = (entry.findtext("a:title", default="", namespaces=ATOM_NS) or "").strip()
@@ -237,6 +242,12 @@ def parse_feed_entries(feed_xml: str, feed: Dict[str, Any]) -> List[Dict[str, An
             post_id = extract_post_id(entry_id)
         if not post_id:
             continue
+
+        if single_post and target_post_id and post_id != target_post_id:
+            continue
+
+        if single_post and target_post_url:
+            link = target_post_url
 
         rows.append(
             {

@@ -211,7 +211,21 @@ def resolve_topic_to_feeds(topic: Dict[str, Any]) -> Tuple[List[Dict[str, str]],
         }], [])
 
     if topic_type == "post":
-        return [], [f"unsupported_post_topic:{label}"]
+        url = compact_text(topic.get("canonical_url", ""))
+        if not url:
+            return [], [f"invalid_post:{label}"]
+        post_url = url.rstrip("/") + "/"
+        return ([{
+            "name": label,
+            "url": post_url.rstrip("/") + "/.rss",
+            "topic_key": topic_key,
+            "topic_label": label,
+            "topic_type": topic_type,
+            "daily_cap": daily_cap,
+            "single_post": "true",
+            "post_url": post_url,
+            "post_id": topic_key.split(":", 1)[1] if ":" in topic_key else "",
+        }], [])
 
     return [], [f"unsupported_topic:{label}"]
 

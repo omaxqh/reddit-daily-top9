@@ -50,7 +50,7 @@ python3 /root/skills/reddit-daily-top9/scripts/install_local.py \
 - 保留认可度说明
 
 ## 已知限制
-- `post URL` topic 还没有完整接进当前列表型 RSS 主链
+- 当前支持 `subreddit / search / feed / keyword / post URL` 五类 topic 输入
 - `report_0800.md` 仍作为备份文件名保留
 
 一句话：

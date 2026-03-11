@@ -34,7 +34,7 @@ description: Build, install, configure, and maintain a reusable Reddit daily Top
 - 不再使用 `feeds.json`
 - 默认不生成 receipt 任务
 - 默认 starter topic 仅保留 `r/openclaw`
-- 当前 `post` topic 仅识别，不承诺已完整接入现有抓取主链
+- 当前 `post` topic 已通过单帖 RSS 接入现有抓取主链
 
 ## 参考
 - 配置说明见：`references/config.md`
