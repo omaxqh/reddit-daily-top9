@@ -15,15 +15,13 @@ TZ = timezone(timedelta(hours=8))
 TMP_SUFFIX = ".tmp"
 DEFAULT_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-EXCERPT_CHARS = 320
-COMMENT_MAX_COUNT = 2
-COMMENT_MAX_CHARS = 120
+EXCERPT_CHARS = 800
+COMMENT_MAX_COUNT = 5
+COMMENT_MAX_CHARS = 200
+CORE_VIEW_LIMIT = 500
+MIN_CORE_VIEW_CHARS = 250
 DEFAULT_PREPARE_TOP_N = 18
 DEFAULT_SEND_TOP_N = 9
-TRANSLATION_CACHE_NAME = "translation_cache.json"
-TRANSLATOR_VERSION = "v1"
-DEFAULT_TRANSLATOR_TIMEOUT = 120
-DEFAULT_TRANSLATOR_SESSION = "telegram:reddit-daily-top9-translate"
 
 
 def now_cn() -> datetime:
@@ -100,44 +98,6 @@ def contains_chinese(text: str) -> bool:
     return any("一" <= char <= "鿿" for char in text)
 
 
-def contains_latin(text: str) -> bool:
-    return bool(re.search(r"[A-Za-z]", text or ""))
-
-
-def strip_latin_segment(text: str) -> str:
-    text = re.sub(r"[A-Za-z][A-Za-z0-9_./:+-]*", "", text)
-    text = re.sub(r"\(\s*\)", "", text)
-    text = re.sub(r"（\s*）", "", text)
-    text = re.sub(r"\s{2,}", " ", text)
-    text = re.sub(r"^[,，、:：;；\-\s]+", "", text)
-    text = re.sub(r"[,，、:：;；\-\s]+$", "", text)
-    return text.strip()
-
-
-def enforce_chinese_text(text: str) -> str:
-    text = compact_text(text)
-    if not text:
-        return ""
-
-    parts: List[str] = []
-    last_end = 0
-    for match in re.finditer(r"https?://\S+", text):
-        prefix = strip_latin_segment(text[last_end:match.start()])
-        if prefix:
-            parts.append(prefix)
-        parts.append(match.group(0))
-        last_end = match.end()
-    suffix = strip_latin_segment(text[last_end:])
-    if suffix:
-        parts.append(suffix)
-
-    text = " ".join(part for part in parts if part)
-    text = text.replace("`", "")
-    text = re.sub(r"\s{2,}", " ", text)
-    text = re.sub(r"([，。！？；：])\1+", r"\1", text)
-    return text.strip()
-
-
 def state_hash(items: List[Dict[str, Any]]) -> str:
     raw = json.dumps(items, ensure_ascii=False, sort_keys=True)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -197,6 +157,7 @@ def build_source_seed(post: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def candidate_score(item: Dict[str, Any]) -> float:
+    """机械打分（保底），用于无模型排序时的 fallback"""
     status = item.get("fetch_status", "unknown")
     body_chars = int(item.get("body_chars", 0) or 0)
     comment_count = int(item.get("comment_count", 0) or 0)
@@ -214,6 +175,81 @@ def candidate_score(item: Dict[str, Any]) -> float:
     return round(score, 2)
 
 
+def ai_rank_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dict[str, Any]]:
+    """
+    模型通读全局后排序（旧版逻辑）：
+    1. 把全部候选的标题 + 正文摘要 + 评论数送入模型
+    2. 让模型返回排序后的 ID 列表
+    3. 按模型排序结果重排
+    """
+    if not candidates:
+        return []
+    
+    # 构建输入：每条的标题 + 正文前 200 字 + 评论数
+    input_items = []
+    for c in candidates:
+        input_items.append({
+            "id": c.get("id", ""),
+            "title": c.get("title", ""),
+            "body_excerpt": c.get("body_excerpt", "")[:200],
+            "comment_count": c.get("comment_count", 0),
+            "fetch_status": c.get("fetch_status", "unknown"),
+        })
+    
+    prompt = (
+        "你是 Reddit 内容编辑。请通读以下全部帖子，按信息价值从高到低排序。\n"
+        "排序标准：\n"
+        "1. 有实操细节、可复用方法的优先\n"
+        "2. 有排他信息、反例、深度分析的优先\n"
+        "3. 评论密度高且讨论质量高的优先\n"
+        "4. 避开纯营销、抱怨、重复内容\n"
+        f"输入（共{len(input_items)}条）：\n{json.dumps(input_items, ensure_ascii=False, indent=2)}\n\n"
+        "只输出排序后的 ID 列表（JSON 数组），如：[\"id1\",\"id2\",...]。不要解释。"
+    )
+    
+    try:
+        import subprocess
+        cmd = [
+            "openclaw", "agent", "--to", "telegram:reddit-daily-top9-rank",
+            "--timeout", "120", "--verbose", "off", "--json", "--message", prompt,
+        ]
+        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=150, check=False)
+        if completed.returncode != 0:
+            raise RuntimeError("ai rank failed")
+        
+        result = json.loads(completed.stdout)
+        payloads = (((result or {}).get("result") or {}).get("payloads") or [])
+        if not payloads:
+            raise ValueError("no payloads")
+        
+        # 提取 JSON 数组
+        text = payloads[0].get("text", "")
+        start = text.find("[")
+        end = text.rfind("]")
+        if start == -1 or end == -1:
+            raise ValueError("no json array")
+        
+        ranked_ids = json.loads(text[start:end+1])
+        
+        # 按模型排序重排
+        id_to_item = {c.get("id"): c for c in candidates}
+        ranked = []
+        for rid in ranked_ids:
+            if rid in id_to_item:
+                ranked.append(id_to_item[rid])
+        
+        # 补齐遗漏（模型可能漏掉一些）
+        ranked_ids_set = set(ranked_ids)
+        for c in candidates:
+            if c.get("id") not in ranked_ids_set:
+                ranked.append(c)
+        
+        return ranked[:top_n]
+    except Exception:
+        # fallback 到机械排序
+        return sorted(candidates, key=lambda x: candidate_score(x), reverse=True)[:top_n]
+
+
 def dedupe_candidates(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     best_by_title: Dict[str, Dict[str, Any]] = {}
     for item in items:
@@ -224,7 +260,12 @@ def dedupe_candidates(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(best_by_title.values())
 
 
-def load_ranked_candidates(clean_dir: str) -> List[Dict[str, Any]]:
+def load_ranked_candidates(clean_dir: str, use_ai_rank: bool = True) -> List[Dict[str, Any]]:
+    """
+    加载候选并排序。
+    use_ai_rank=True 时，调用模型通读全局后排序（旧版逻辑）。
+    use_ai_rank=False 时，用机械打分排序。
+    """
     payload = load_json(os.path.join(clean_dir, "report_source.json"), [])
     items: List[Dict[str, Any]] = []
     if not isinstance(payload, list):
@@ -236,169 +277,30 @@ def load_ranked_candidates(clean_dir: str) -> List[Dict[str, Any]]:
         seed["candidate_score"] = candidate_score(seed)
         items.append(seed)
     items = dedupe_candidates(items)
-    items.sort(key=lambda item: (float(item.get("candidate_score", 0)), item.get("captured_at", ""), item.get("id", "")), reverse=True)
-    return items
+    
+    if use_ai_rank and len(items) >= 3:
+        # 模型通读全局后排序
+        return ai_rank_candidates(items, top_n=len(items))
+    else:
+        # 机械排序
+        items.sort(key=lambda item: (float(item.get("candidate_score", 0)), item.get("captured_at", ""), item.get("id", "")), reverse=True)
+        return items
 
 
-def load_project_config(base_dir: str) -> Dict[str, Any]:
-    payload = load_json(os.path.join(base_dir, "config.json"), {})
-    return payload if isinstance(payload, dict) else {}
-
-
-def resolve_format_options(base_dir: str) -> Dict[str, Any]:
-    config = load_project_config(base_dir)
-    format_cfg = config.get("format", {}) if isinstance(config.get("format"), dict) else {}
-    translator_cfg = format_cfg.get("translator", {}) if isinstance(format_cfg.get("translator"), dict) else {}
-    language = compact_text(format_cfg.get("language", "中文")) or "中文"
-    force_chinese = bool(format_cfg.get("force_chinese", language == "中文"))
-    return {
-        "language": language,
-        "force_chinese": force_chinese,
-        "translator_enabled": bool(translator_cfg.get("enabled", force_chinese)),
-        "translator_timeout": int(translator_cfg.get("timeout_seconds", DEFAULT_TRANSLATOR_TIMEOUT) or DEFAULT_TRANSLATOR_TIMEOUT),
-        "translator_session": compact_text(translator_cfg.get("session", DEFAULT_TRANSLATOR_SESSION)) or DEFAULT_TRANSLATOR_SESSION,
-    }
-
-
-def translation_cache_path(clean_dir: str) -> str:
-    return os.path.join(clean_dir, TRANSLATION_CACHE_NAME)
-
-
-def load_translation_cache(clean_dir: str) -> Dict[str, Any]:
-    payload = load_json(translation_cache_path(clean_dir), {})
-    return payload if isinstance(payload, dict) else {}
-
-
-def save_translation_cache(clean_dir: str, cache: Dict[str, Any]) -> None:
-    save_json(translation_cache_path(clean_dir), cache)
-
-
-def extract_json_object(text: str) -> Dict[str, Any]:
-    text = compact_text(text)
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("translator output missing json object")
-    return json.loads(text[start : end + 1])
-
-
-def translation_prompt(payload: Dict[str, Any]) -> str:
-    return (
-        "你是中文重写器。请把输入 JSON 改写成自然、准确、简洁的简体中文。\n"
-        "硬规则：\n"
-        "1. 只输出 JSON，不要解释，不要代码块。\n"
-        "2. 输出结构必须严格是 {\"title\":\"...\",\"excerpt\":\"...\",\"comments\":[\"...\",...]}。\n"
-        "3. 除 URL 外，不要出现任何英文字符、英文缩写或英文原句。\n"
-        "4. 产品名、项目名、库名如果无法直译，也改写成中文描述，不要保留英文。\n"
-        "5. 不要编造事实，可以适度压缩，让表述更像中文日报卡片。\n"
-        "6. 空字段保持空字符串或空数组。\n"
-        f"输入 JSON：{json.dumps(payload, ensure_ascii=False)}"
-    )
-
-
-def fallback_translation(candidate: Dict[str, Any]) -> Dict[str, Any]:
-    title = enforce_chinese_text(candidate.get("title", ""))
-    if not title:
-        title = "社区帖子"
-
-    excerpt = enforce_chinese_text(candidate.get("body_excerpt", ""))
-    if not excerpt:
-        excerpt = "原帖讨论了一个与目标社区相关的话题，已抓取到部分内容，现按中文保底输出。"
-
-    comments = [enforce_chinese_text(comment) for comment in candidate.get("key_comments", []) or []]
-    comments = [comment for comment in comments if comment]
-    if not comments and int(candidate.get("comment_count", 0) or 0) > 0:
-        comments = ["评论区有补充观点，但本轮中文改写失败，建议点开原帖查看。"]
-
-    return {
-        "title": title,
-        "excerpt": excerpt,
-        "comments": comments[:COMMENT_MAX_COUNT],
-    }
-
-
-def translate_candidate(candidate: Dict[str, Any], clean_dir: str, options: Dict[str, Any], cache: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
-    if not options.get("force_chinese") or not options.get("translator_enabled"):
-        return fallback_translation(candidate), False
-
-    cache_key = f"{TRANSLATOR_VERSION}:{candidate_hash(candidate)}"
-    cached = cache.get(cache_key)
-    if isinstance(cached, dict):
-        return cached, False
-
-    payload = {
-        "title": compact_text(candidate.get("title", "")),
-        "excerpt": compact_text(candidate.get("body_excerpt", "")),
-        "comments": [compact_text(comment) for comment in candidate.get("key_comments", []) or []][:COMMENT_MAX_COUNT],
-    }
-
-    translated = fallback_translation(candidate)
-    try:
-        cmd = [
-            "openclaw",
-            "agent",
-            "--to",
-            str(options.get("translator_session", DEFAULT_TRANSLATOR_SESSION)),
-            "--timeout",
-            str(options.get("translator_timeout", DEFAULT_TRANSLATOR_TIMEOUT)),
-            "--verbose",
-            "off",
-            "--json",
-            "--message",
-            translation_prompt(payload),
-        ]
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=int(options.get("translator_timeout", DEFAULT_TRANSLATOR_TIMEOUT)) + 30,
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(compact_text(completed.stderr or completed.stdout) or "translator cli failed")
-
-        result_payload = json.loads(completed.stdout)
-        payloads = (((result_payload or {}).get("result") or {}).get("payloads") or [])
-        if not payloads:
-            raise ValueError("translator result payloads empty")
-        translated_raw = extract_json_object(payloads[0].get("text", ""))
-        translated = {
-            "title": enforce_chinese_text(str(translated_raw.get("title", ""))),
-            "excerpt": enforce_chinese_text(str(translated_raw.get("excerpt", ""))),
-            "comments": [
-                enforce_chinese_text(str(comment))
-                for comment in translated_raw.get("comments", [])
-                if compact_text(str(comment))
-            ][:COMMENT_MAX_COUNT],
-        }
-        if not translated["title"]:
-            translated["title"] = fallback_translation(candidate)["title"]
-        if not translated["excerpt"]:
-            translated["excerpt"] = fallback_translation(candidate)["excerpt"]
-        if not translated["comments"] and int(candidate.get("comment_count", 0) or 0) > 0:
-            translated["comments"] = fallback_translation(candidate)["comments"]
-    except Exception:
-        translated = fallback_translation(candidate)
-
-    cache[cache_key] = translated
-    return translated, True
-
-
-def display_title(candidate: Dict[str, Any], index: int, translated: Dict[str, Any] | None = None, force_chinese: bool = False) -> str:
-    if force_chinese and translated:
-        title = compact_text(translated.get("title", ""))
-        if title:
-            return trim_text(title, 28)
-        return f"帖子{index}"
-
+def fallback_display_title(candidate: Dict[str, Any]) -> str:
     title = compact_text(candidate.get("title", ""))
     if contains_chinese(title):
         return trim_text(title, 28)
     if title:
         return f"Reddit话题：{trim_text(title, 24)}"
-    return f"Reddit候选#{index}"
+    return "Reddit话题：无标题"
+
+
+def display_title(candidate: Dict[str, Any], index: int) -> str:
+    title = fallback_display_title(candidate)
+    if title == "Reddit话题：无标题":
+        return f"Reddit候选#{index}"
+    return title
 
 
 def recognition(candidate: Dict[str, Any]) -> Dict[str, str]:
@@ -406,67 +308,281 @@ def recognition(candidate: Dict[str, Any]) -> Dict[str, str]:
     status = candidate.get("fetch_status", "unknown")
     if comment_count >= 10:
         level = "高"
-        pro = "评论密度高，能看到多侧观点。"
-        con = "热度高不代表信息都可靠。"
+        pro = "评论密度高，能看到赞成与反对两边的真实理由。"
+        con = "高热度不等于高质量，情绪噪声也会同步上来。"
     elif comment_count >= 3:
         level = "中"
-        pro = "评论有补充，可辅助判断。"
-        con = "样本量仍有限。"
+        pro = "有一些补充信息，足够辅助判断帖子真实价值。"
+        con = "讨论样本还不够厚，结论需要留余地。"
     else:
         level = "低"
         pro = "至少保留了正文线索。"
-        con = "评论样本偏薄。"
+        con = "评论样本偏薄，难以判断讨论质量。"
     if status != "done":
         level = "低"
         con = "抓取受限，信息完整性不足。"
     return {"level": level, "pro": pro, "con": con}
 
 
-def build_message_text(candidate: Dict[str, Any], index: int, clean_dir: str, options: Dict[str, Any], cache: Dict[str, Any]) -> Tuple[str, bool]:
-    force_chinese = bool(options.get("force_chinese"))
-    translated: Dict[str, Any] | None = None
-    cache_changed = False
+def extract_json_from_text(text: str) -> Tuple[bool, Any]:
+    text = text or ""
+    candidates: List[str] = []
+    fence_hits = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    candidates.extend(fence_hits)
+    candidates.append(text)
 
-    if force_chinese:
-        translated, cache_changed = translate_candidate(candidate, clean_dir, options, cache)
+    for candidate in candidates:
+        snippet = candidate.strip()
+        if not snippet:
+            continue
+        try:
+            return True, json.loads(snippet)
+        except Exception:
+            pass
 
-    title = display_title(candidate, index, translated=translated, force_chinese=force_chinese)
-    original_title = compact_text(candidate.get("original_title", candidate.get("title", "")))
-    status = candidate.get("fetch_status", "unknown")
-    fail_reason = compact_text(candidate.get("fail_reason", ""))
+        for left, right in (("[", "]"), ("{", "}")):
+            start = snippet.find(left)
+            end = snippet.rfind(right)
+            if start == -1 or end == -1 or end <= start:
+                continue
+            try:
+                return True, json.loads(snippet[start : end + 1])
+            except Exception:
+                continue
 
-    if force_chinese and translated:
-        excerpt = compact_text(translated.get("excerpt", ""))
-        comments = translated.get("comments", []) or []
+    return False, None
+
+
+def trim_complete_text(text: str, limit: int, min_boundary: int = 72) -> str:
+    text = compact_text(text)
+    if len(text) <= limit:
+        return text
+
+    primary_marks = "。！？；"
+    secondary_marks = "，："
+
+    primary_cut = max((idx for idx, ch in enumerate(text[: limit + 1]) if ch in primary_marks), default=-1)
+    if primary_cut >= min_boundary - 1:
+        return text[: primary_cut + 1].strip()
+
+    secondary_cut = max((idx for idx, ch in enumerate(text[: limit + 1]) if ch in secondary_marks), default=-1)
+    if secondary_cut >= min_boundary - 1:
+        trimmed = text[:secondary_cut].rstrip("，：、； ")
+        if trimmed:
+            return trimmed + "。"
+
+    trimmed = text[:limit].rstrip("，：、；,.!！？ ")
+    return trimmed + "。"
+
+
+def request_publish_map(prompt: str, valid_ids: set[str]) -> Dict[str, Dict[str, Any]]:
+    cmd = [
+        "openclaw",
+        "agent",
+        "--agent",
+        "main",
+        "--timeout",
+        "180",
+        "--verbose",
+        "off",
+        "--json",
+        "--message",
+        prompt,
+    ]
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=220, check=False)
+        if completed.returncode != 0:
+            return {}
+        result = json.loads(completed.stdout)
+        payloads = (((result or {}).get("result") or {}).get("payloads") or [])
+        if not payloads:
+            return {}
+        ok, parsed = extract_json_from_text(payloads[0].get("text", ""))
+        if not ok:
+            return {}
+
+        items = parsed
+        if isinstance(parsed, dict):
+            maybe = parsed.get("items")
+            if isinstance(maybe, list):
+                items = maybe
+
+        if not isinstance(items, list):
+            return {}
+
+        output: Dict[str, Dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id", "")).strip()
+            if not item_id or item_id not in valid_ids:
+                continue
+            output[item_id] = item
+        return output
+    except Exception:
+        return {}
+
+
+def build_publish_prompt(source_items: List[Dict[str, Any]]) -> str:
+    return (
+        "你是中文科技编辑。请把下面的 Reddit 候选条目改写成可直接发送的中文卡片素材。\n"
+        "要求：\n"
+        "1) title 必须是中文标题，简洁、像新闻标题，不要保留英文整句。\n"
+        "2) core_viewpoint 必须是 250-300 个中文字符，允许 3-5 句，写清做了什么、怎么做、解决什么、代价/限制；必须是完整句子，禁止半句收尾。\n"
+        "3) core_viewpoint 至少包含 2 个具体细节，优先保留流程、组件、评论补充、反例、部署门槛或约束条件。\n"
+        "4) 不要写模板腔，避免“问题很真实”“价值在于”“限制是内容更”这类空话；优先写具体事实。\n"
+        "5) key_comments 选 2-4 条，必须是中文；优先排他信息、实操细节、反例。\n"
+        "6) recognition_level 只能是 高/中/低。\n"
+        "7) recognition_pro / recognition_con 各一句，具体不空泛。\n"
+        "8) 严禁编造，不确定就保守描述。\n"
+        "输出：只输出 JSON 数组，不要任何解释。每项结构：\n"
+        "{id,title,core_viewpoint,key_comments,recognition_level,recognition_pro,recognition_con}\n\n"
+        f"输入：{json.dumps(source_items, ensure_ascii=False)}"
+    )
+
+
+def build_rewrite_prompt(source_items: List[Dict[str, Any]]) -> str:
+    return (
+        "你是中文科技编辑。下面这些条目的第一版 core_viewpoint 太短，没有达到要求。请只重写这些条目。\n"
+        "硬性要求：\n"
+        f"1) core_viewpoint 必须至少 {MIN_CORE_VIEW_CHARS} 个中文字符，目标 250-320 字，允许 4-5 句。\n"
+        "2) 必须补足细节，至少写出两个具体事实，例如流程步骤、调用方式、评论反例、部署门槛、争议点。\n"
+        "3) 必须完整成段，不能偷懒写成一句长句，也不能回避限制条件。\n"
+        "4) title、key_comments、recognition_* 也一并输出，保持可直接发送。\n"
+        "5) 严禁编造，不确定就用保守表述。\n"
+        "输出：只输出 JSON 数组，不要任何解释。每项结构：\n"
+        "{id,title,core_viewpoint,key_comments,recognition_level,recognition_pro,recognition_con}\n\n"
+        f"输入：{json.dumps(source_items, ensure_ascii=False)}"
+    )
+
+
+def ai_build_publish_map(sources: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    if not sources:
+        return {}
+
+    source_items = []
+    source_by_id: Dict[str, Dict[str, Any]] = {}
+    for src in sources:
+        item = {
+            "id": src.get("id", ""),
+            "original_title": src.get("original_title", src.get("title", "")),
+            "body_excerpt": src.get("body_excerpt", ""),
+            "key_comments": src.get("key_comments", []) or [],
+            "comment_count": src.get("comment_count", 0),
+            "fetch_status": src.get("fetch_status", "unknown"),
+            "fail_reason": src.get("fail_reason", ""),
+            "url": src.get("url", ""),
+        }
+        source_items.append(item)
+        source_by_id[item["id"]] = item
+
+    valid_ids = {src.get("id", "") for src in sources}
+    output = request_publish_map(build_publish_prompt(source_items), valid_ids)
+
+    short_items = []
+    for item_id, source_item in source_by_id.items():
+        draft = output.get(item_id, {})
+        core = compact_text(draft.get("core_viewpoint", ""))
+        if len(core) >= MIN_CORE_VIEW_CHARS:
+            continue
+        short_items.append(
+            {
+                **source_item,
+                "draft_title": draft.get("title", ""),
+                "draft_core_viewpoint": core,
+                "draft_key_comments": draft.get("key_comments", []) or [],
+                "draft_recognition_level": draft.get("recognition_level", ""),
+                "draft_recognition_pro": draft.get("recognition_pro", ""),
+                "draft_recognition_con": draft.get("recognition_con", ""),
+            }
+        )
+
+    if short_items:
+        rewrite_map = request_publish_map(build_rewrite_prompt(short_items), {item["id"] for item in short_items})
+        for item_id, item in rewrite_map.items():
+            output[item_id] = item
+
+    return output
+
+
+def normalize_publish(source: Dict[str, Any], publish_raw: Dict[str, Any]) -> Dict[str, Any]:
+    vote_default = recognition(source)
+    raw = publish_raw if isinstance(publish_raw, dict) else {}
+
+    title = compact_text(raw.get("title", ""))
+    if not title or not contains_chinese(title):
+        title = fallback_display_title(source)
+
+    core = compact_text(raw.get("core_viewpoint", ""))
+    if not core:
+        excerpt = compact_text(source.get("body_excerpt", ""))
+        if excerpt:
+            core = excerpt
+        else:
+            core = "正文抓取受限，本条基于可得元信息保底输出。"
+
+    status = source.get("fetch_status", "unknown")
+    if status == "failed":
+        core = "正文与评论均受限，本条仅保留来源线索。"
+    elif status == "partial":
+        core = trim_complete_text(f"{core} 评论抓取不完整。", CORE_VIEW_LIMIT)
     else:
-        excerpt = compact_text(candidate.get("body_excerpt", ""))
-        comments = candidate.get("key_comments", []) or []
+        core = trim_complete_text(core, CORE_VIEW_LIMIT)
+
+    raw_comments = raw.get("key_comments", [])
+    comments: List[str] = []
+    if isinstance(raw_comments, list):
+        comments = choose_comments([str(comment) for comment in raw_comments], max_count=COMMENT_MAX_COUNT)
+    if not comments:
+        comments = choose_comments(source.get("key_comments", []) or [], max_count=COMMENT_MAX_COUNT)
+
+    level = compact_text(raw.get("recognition_level", ""))
+    if level not in {"高", "中", "低"}:
+        level = vote_default["level"]
+
+    pro = compact_text(raw.get("recognition_pro", "")) or vote_default["pro"]
+    con = compact_text(raw.get("recognition_con", "")) or vote_default["con"]
+
+    return {
+        "title": title,
+        "core_viewpoint": core,
+        "key_comments": comments,
+        "recognition_level": level,
+        "recognition_pro": pro,
+        "recognition_con": con,
+    }
+
+
+def build_message_text(source: Dict[str, Any], publish: Dict[str, Any], index: int) -> str:
+    title = compact_text(publish.get("title", "")) or display_title(source, index)
+    original_title = compact_text(source.get("original_title", source.get("title", "")))
+    status = source.get("fetch_status", "unknown")
+    fail_reason = compact_text(source.get("fail_reason", ""))
 
     lines = [f"{index}. {title}"]
-    if not force_chinese and original_title and original_title != title:
+    if original_title and original_title != title:
         lines.append(f"原标题：{trim_text(original_title, 90)}")
 
-    if excerpt:
-        core = excerpt
-    else:
+    core = compact_text(publish.get("core_viewpoint", ""))
+    if not core:
         core = "正文抓取受限，本条基于可得元信息保底输出。"
-    if status == "partial":
-        core = trim_text(f"{core}（评论抓取不完整）", 130)
-    elif status == "failed":
-        core = "正文与评论均受限，本条仅保留来源线索。"
     lines.append(f"核心观点：{core}")
 
+    comments = publish.get("key_comments", []) or []
     if comments:
         lines.append("关键评论：")
         for comment in comments[:COMMENT_MAX_COUNT]:
             lines.append(f"- {compact_text(comment)}")
 
-    vote = recognition(candidate)
-    lines.append(f"认可度：{vote['level']}；赞成理由：{vote['pro']}；反对理由：{vote['con']}")
+    level = compact_text(publish.get("recognition_level", "")) or recognition(source)["level"]
+    pro = compact_text(publish.get("recognition_pro", "")) or recognition(source)["pro"]
+    con = compact_text(publish.get("recognition_con", "")) or recognition(source)["con"]
+    lines.append(f"认可度：{level}；赞成理由：{pro}；反对理由：{con}")
+
     if status != "done":
         lines.append(f"抓取状态：{status}（{fail_reason or '受限'}）")
-    lines.append(candidate.get("url", ""))
-    return "\n".join(lines).strip(), cache_changed
+    lines.append(source.get("url", ""))
+    return "\n".join(lines).strip()
 
 
 def write_report_backup(clean_dir: str, payload: Dict[str, Any]) -> None:
@@ -484,32 +600,57 @@ def write_report_backup(clean_dir: str, payload: Dict[str, Any]) -> None:
     atomic_write_text(os.path.join(clean_dir, "report_backup.md"), "\n".join(lines).strip() + "\n")
 
 
-def build_state(base_dir: str, clean_dir: str, date_key: str, prepare_top_n: int, top_n: int) -> Dict[str, Any]:
-    ranked = load_ranked_candidates(clean_dir)
+def build_state(clean_dir: str, date_key: str, prepare_top_n: int, top_n: int) -> Dict[str, Any]:
+    ranked = load_ranked_candidates(clean_dir, use_ai_rank=True)
     candidates = ranked[:prepare_top_n]
+    selected_sources = candidates[:top_n]
     selected = []
-    format_options = resolve_format_options(base_dir)
-    translation_cache = load_translation_cache(clean_dir)
-    cache_changed = False
 
-    for index, candidate in enumerate(candidates[:top_n], start=1):
-        message_text, item_cache_changed = build_message_text(candidate, index, clean_dir, format_options, translation_cache)
-        cache_changed = cache_changed or item_cache_changed
+    # 统计抓取状态（用于汇总头）
+    done_count = sum(1 for c in ranked if c.get("fetch_status") == "done")
+    partial_count = sum(1 for c in ranked if c.get("fetch_status") == "partial")
+    failed_count = sum(1 for c in ranked if c.get("fetch_status") == "failed")
+
+    # 生成汇总头（旧版格式必须有）
+    header_lines = [
+        f"OpenClaw Reddit 中文日报 [{date_key} 08:00]",
+        "",
+        f"- 抓取总数：{len(ranked)}（done={done_count} / partial={partial_count} / failed={failed_count}）",
+        f"- 精选条数：{min(len(selected_sources), top_n)}",
+    ]
+    if failed_count == 0 and partial_count == 0:
+        header_lines.append("- 受限说明：今日抓取正常，精选条目均为 done 状态。")
+    elif failed_count == 0:
+        header_lines.append(f"- 受限说明：今日 {partial_count} 条评论抓取不完整，精选条目已避开受限内容。")
+    else:
+        header_lines.append(f"- 受限说明：今日 {failed_count} 条抓取失败，{partial_count} 条不完整，精选条目已优先选择 done 状态。")
+    header_lines.append("")
+    header_lines.append("---")
+    header_text = "\n".join(header_lines)
+
+    ai_publish_map = ai_build_publish_map(selected_sources)
+
+    for index, source in enumerate(selected_sources, start=1):
+        publish = normalize_publish(source, ai_publish_map.get(source.get("id", ""), {}))
+        message_text = build_message_text(source, publish, index)
+
+        # 第一条消息前加上汇总头
+        if index == 1:
+            message_text = header_text + "\n\n" + message_text
+
         selected.append(
             {
-                "id": candidate.get("id", f"item-{index}"),
+                "id": source.get("id", f"item-{index}"),
                 "index": index,
-                "candidate": candidate,
-                "candidate_hash": candidate_hash(candidate),
+                "source": source,
+                "publish": publish,
+                "candidate_hash": candidate_hash(source),
                 "status": "pending",
                 "sent_at": "",
                 "error": "",
                 "message_text": message_text,
             }
         )
-
-    if cache_changed:
-        save_translation_cache(clean_dir, translation_cache)
 
     existing = load_json(os.path.join(clean_dir, "send_state.json"), {})
     existing_items = {item.get("id"): item for item in existing.get("items", []) if isinstance(item, dict)}
@@ -622,7 +763,7 @@ def list_pending(clean_dir: str) -> Dict[str, Any]:
 def run_prepare(args: argparse.Namespace) -> int:
     date_key = resolve_date(args.date)
     clean_dir = os.path.join(args.base_dir, "daily", date_key, "clean")
-    payload = build_state(args.base_dir, clean_dir, date_key, args.prepare_top_n, args.top_n)
+    payload = build_state(clean_dir, date_key, args.prepare_top_n, args.top_n)
     emit_json(summarize_state(payload))
     return 0
 
@@ -630,7 +771,6 @@ def run_prepare(args: argparse.Namespace) -> int:
 def run_send(args: argparse.Namespace) -> int:
     date_key = resolve_date(args.date)
     clean_dir = os.path.join(args.base_dir, "daily", date_key, "clean")
-    _ = build_state(args.base_dir, clean_dir, date_key, args.prepare_top_n, args.top_n)
     emit_json(list_pending(clean_dir))
     return 0
 
@@ -666,7 +806,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-top-n", type=int, default=DEFAULT_PREPARE_TOP_N, help="prepare 阶段保留候选数")
     parser.add_argument("--top-n", type=int, default=DEFAULT_SEND_TOP_N, help="最终正式发送条数")
     parser.add_argument("--prepare", action="store_true", help="生成 send_state 摘要")
-    parser.add_argument("--send", action="store_true", help="生成 send_state 并输出待发送最小清单")
+    parser.add_argument("--send", action="store_true", help="读取 send_state 并输出待发送最小清单")
     parser.add_argument("--list-pending", action="store_true", help="输出待发送项目最小清单")
     parser.add_argument("--summary", action="store_true", help="输出发送账本摘要")
     parser.add_argument("--mark-sent", dest="item_id", help="把某条标记为 sent")
